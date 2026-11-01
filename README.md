@@ -1,25 +1,8 @@
-GNN-COSBO
+GNN-COSBO: GNN-COSBO: Graph Neural Network Cost-Sensitive Boosting with Explainability for 5G-Core Network Failure Classification Data
 
-1. Place the 5G failure-classification dataset in the `data/` directory.
+GNN-COSBO is a cost-sensitive boosting framework for imbalanced failure classification in 5G core-network digital twins. The framework uses GraphSAGE weak learners and jointly integrates **class-dependent cost-sensitive learning**, **adaptive instance reweighting**, and **iterative feature reinjection** to improve minority failure detection while mitigating oversquashing-related information loss. The framework also incorporates **class-wise SHAP analysis** for model explainability.
 
-2. Run the preprocessing script to normalize the node features, encode the failure labels, construct the 5-NN graph, and generate the 60%/20%/20% training, validation, and test masks:
-
-```bash
-python data_process.py
-```
-
-3. Train and evaluate GNN-COSBO using:
-
-```bash
-python main.py
-```
-
-4. To run the explainability analysis:
-
-```bash
-python explain.py
-```
-
+#
 The default configuration uses GraphSAGE weak learners, class-dependent cost-sensitive learning, adaptive boosting, and iterative feature reinjection. Other experimental parameters can be modified through the configuration or argument parser.
 
 ## Data Preprocessing
