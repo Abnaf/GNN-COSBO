@@ -1,0 +1,1050 @@
+import pandas as pd
+import tkinter as tk
+from tkinter import filedialog
+from sklearn.metrics import f1_score, confusion_matrix, roc_auc_score, recall_score
+from sklearn.preprocessing import MinMaxScaler, LabelEncoder
+from sklearn.neighbors import kneighbors_graph
+from sklearn.model_selection import train_test_split
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import torch.nn.functional as F
+import numpy as np
+from torch_geometric.data import Data
+from torch_geometric.nn import SAGEConv, GATConv, GCNConv
+from torch_geometric.utils import to_undirected, remove_self_loops
+import networkx as nx
+from collections import defaultdict
+import random
+import traceback
+import sys
+
+# --- HYPERPARAMETERS & STABILITY FIX ---
+HIDDEN_DIM = 128
+WEAK_LEARNER_EPOCHS = 50  # epochs per weak learner
+WEAK_LEARNER_LR = 0.01
+BOOST_ROUNDS = 4  # T; sensitivity analysis selected T=4
+KNN_K = 5
+NUM_EPOCHS_STANDARD = 250 # Epochs for standard (non-boosting) models
+NUM_TRIALS = 5  # five independent runs
+EPSILON_ERROR = 1e-10 # Used to prevent division by zero or log(0)
+MAX_BETA = 5.0 # Caps the learner weight to prevent overflow (NaN/Inf)
+DROPOUT = 0.5
+WEIGHT_DECAY = 5e-4
+GAMMA_COST = 0.75
+ALPHA_MAX = 7.0
+TRAIN_RATIO, VAL_RATIO, TEST_RATIO = 0.60, 0.20, 0.20
+
+# --- OVERSQUASHING BASELINE HYPERPARAMETERS ---
+PANDA_TOP_FRAC = 0.10          # fraction of highest-centrality nodes to expand
+PANDA_EXPANSION = 2            # expanded hidden width multiplier
+GPER_ADD_FRAC = 0.05           # fraction of |E| high-resistance non-edges added
+GPER_REMOVE_FRAC = 0.02        # fraction of |E| low-resistance edges removed
+COMFY_REWIRE_FRAC = 0.05       # fraction of |E| edges considered for ComFy rewiring
+
+
+# --- UTILITY FUNCTIONS ---
+def set_seed(seed):
+    """Sets the seed for reproducibility across trials."""
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+    random.seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+def select_csv_file():
+    """Opens a Tkinter file dialog to select a CSV file (Fallback to hardcoded path)."""
+    try:
+        root = tk.Tk()
+        root.withdraw()
+        # Ensure Tkinter is initialized and the root is available
+        if root.winfo_exists():
+            file_path = filedialog.askopenfilename(filetypes=[("CSV files", "*.csv")])
+            root.destroy()
+            return file_path if file_path else 'data.csv'
+        else:
+            return 'data.csv'
+    except Exception:
+        # Fallback to hardcoded path for non-GUI environments
+        return 'data.csv'
+
+def macro_recall(y_true, y_pred):
+    """Calculates Macro-averaged Recall."""
+    return recall_score(y_true, y_pred, average='macro', zero_division=0)
+
+def macro_f1(y_true, y_pred):
+    """Calculates Macro-averaged F1-Score."""
+    return f1_score(y_true, y_pred, average='macro', zero_division=0)
+
+# --- BASE GNN MODELS (for standard training) ---
+
+class GCN(nn.Module):
+    def __init__(self, input_dim, hidden_dim, output_dim):
+        super(GCN, self).__init__()
+        self.conv1 = GCNConv(input_dim, hidden_dim)
+        self.conv2 = GCNConv(hidden_dim, output_dim)
+
+    def forward(self, data):
+        x, edge_index = data.x, data.edge_index
+        x = F.relu(self.conv1(x, edge_index))
+        x = F.dropout(x, p=0.5, training=self.training)
+        x = self.conv2(x, edge_index)
+        return x
+
+class GAT(nn.Module):
+    def __init__(self, input_dim, hidden_dim, output_dim, heads=4):
+        super(GAT, self).__init__()
+        # The output of the first GATConv is hidden_dim * heads
+        self.conv1 = GATConv(input_dim, hidden_dim, heads=heads, dropout=0.6)
+        # The input of the second GATConv must match the output of the first
+        self.conv2 = GATConv(hidden_dim * heads, output_dim, heads=1, concat=False, dropout=0.6)
+
+    def forward(self, data):
+        x, edge_index = data.x, data.edge_index
+        x = F.elu(self.conv1(x, edge_index))
+        x = self.conv2(x, edge_index)
+        return x
+
+class GraphSAGE(nn.Module):
+    def __init__(self, input_dim, hidden_dim, output_dim):
+        super(GraphSAGE, self).__init__()
+        self.sage1 = SAGEConv(input_dim, hidden_dim)
+        self.sage2 = SAGEConv(hidden_dim, output_dim)
+
+    def forward(self, data):
+        x, edge_index = data.x, data.edge_index
+        x = torch.relu(self.sage1(x, edge_index))
+        x = self.sage2(x, edge_index)
+        return x
+
+
+class PANDA_Model(nn.Module):
+    def __init__(self, input_dim, hidden_dim, output_dim,
+                 top_frac=PANDA_TOP_FRAC, expansion=PANDA_EXPANSION):
+        super().__init__()
+        self.hidden_dim = hidden_dim
+        self.expanded_dim = hidden_dim * expansion
+        self.top_frac = top_frac
+
+        self.base_conv = SAGEConv(input_dim, hidden_dim)
+        self.wide_conv = SAGEConv(input_dim, self.expanded_dim)
+        self.wide_to_base = nn.Linear(self.expanded_dim, hidden_dim)
+        self.out_conv = SAGEConv(hidden_dim, output_dim)
+
+    @staticmethod
+    def _centrality_mask(edge_index, num_nodes, top_frac):
+        src, dst = edge_index
+        degree = torch.bincount(
+            torch.cat([src, dst]), minlength=num_nodes
+        ).float()
+        k = max(1, int(np.ceil(top_frac * num_nodes)))
+        top_idx = torch.topk(degree, k=min(k, num_nodes)).indices
+        mask = torch.zeros(num_nodes, dtype=torch.bool, device=edge_index.device)
+        mask[top_idx] = True
+        return mask
+
+    def forward(self, data):
+        x, edge_index = data.x, data.edge_index
+        base_h = F.relu(self.base_conv(x, edge_index))
+        wide_h = F.relu(self.wide_conv(x, edge_index))
+        wide_h = F.relu(self.wide_to_base(wide_h))
+
+        mask = self._centrality_mask(edge_index, x.size(0), self.top_frac)
+        h = base_h.clone()
+        h[mask] = wide_h[mask]
+
+        h = F.dropout(h, p=0.5, training=self.training)
+        return self.out_conv(h, edge_index)
+
+
+class GBN_Model(nn.Module):
+    def __init__(self, input_dim, hidden_dim, output_dim):
+        super().__init__()
+        self.self1 = nn.Linear(input_dim, hidden_dim)
+        self.neigh1 = GCNConv(input_dim, hidden_dim)
+        self.self2 = nn.Linear(hidden_dim, output_dim)
+        self.neigh2 = GCNConv(hidden_dim, output_dim)
+        self.gate_scale = nn.Parameter(torch.tensor(1.0))
+        self.gate_bias = nn.Parameter(torch.tensor(0.0))
+
+    def _local_gate(self, edge_index, num_nodes):
+        src, dst = edge_index
+        deg = torch.bincount(
+            torch.cat([src, dst]), minlength=num_nodes
+        ).float().clamp_min(1.0)
+
+        # Mean neighbor degree.
+        neigh_sum = torch.zeros(num_nodes, device=edge_index.device)
+        neigh_cnt = torch.zeros(num_nodes, device=edge_index.device)
+        neigh_sum.index_add_(0, dst, deg[src])
+        neigh_cnt.index_add_(0, dst, torch.ones_like(dst, dtype=torch.float))
+        mean_neigh_deg = neigh_sum / neigh_cnt.clamp_min(1.0)
+
+        contrast = torch.abs(torch.log1p(deg) - torch.log1p(mean_neigh_deg))
+        contrast = (contrast - contrast.mean()) / (contrast.std() + 1e-6)
+        return torch.sigmoid(self.gate_scale * contrast + self.gate_bias).unsqueeze(1)
+
+    def forward(self, data):
+        x, edge_index = data.x, data.edge_index
+        gate = self._local_gate(edge_index, x.size(0))
+
+        h_self = self.self1(x)
+        h_neigh = self.neigh1(x, edge_index)
+        h = F.relu(gate * h_neigh + (1.0 - gate) * h_self)
+        h = F.dropout(h, p=0.5, training=self.training)
+
+        out_self = self.self2(h)
+        out_neigh = self.neigh2(h, edge_index)
+        return gate * out_neigh + (1.0 - gate) * out_self
+
+
+def _edge_index_to_simple_undirected(edge_index, num_nodes):
+    """Return unique undirected edges as (u, v) with u < v."""
+    ei = to_undirected(edge_index, num_nodes=num_nodes)
+    ei, _ = remove_self_loops(ei)
+    pairs = set()
+    for u, v in ei.t().detach().cpu().tolist():
+        if u != v:
+            a, b = (u, v) if u < v else (v, u)
+            pairs.add((a, b))
+    return pairs
+
+
+def _pairs_to_edge_index(pairs, device):
+    """Convert undirected edge pairs into bidirectional PyG edge_index."""
+    if not pairs:
+        return torch.empty((2, 0), dtype=torch.long, device=device)
+    edges = []
+    for u, v in sorted(pairs):
+        edges.append((u, v))
+        edges.append((v, u))
+    return torch.tensor(edges, dtype=torch.long, device=device).t().contiguous()
+
+
+def gper_rewire(edge_index, num_nodes,
+                add_frac=GPER_ADD_FRAC, remove_frac=GPER_REMOVE_FRAC):
+    """
+    Effective-resistance rewiring inspired by GPER:
+      - add high-effective-resistance non-edges;
+      - remove low-effective-resistance existing edges.
+
+    The pseudoinverse is feasible for the current small 5G graphs but can be
+    expensive for very large graphs.
+    """
+    device = edge_index.device
+    pairs = _edge_index_to_simple_undirected(edge_index, num_nodes)
+    if len(pairs) == 0:
+        return edge_index
+
+    A = np.zeros((num_nodes, num_nodes), dtype=np.float64)
+    for u, v in pairs:
+        A[u, v] = 1.0
+        A[v, u] = 1.0
+
+    D = np.diag(A.sum(axis=1))
+    L = D - A
+    # Moore-Penrose pseudoinverse for effective resistance.
+    L_plus = np.linalg.pinv(L + np.eye(num_nodes) * 1e-8)
+
+    diag = np.diag(L_plus)
+    R = diag[:, None] + diag[None, :] - 2.0 * L_plus
+
+    m = max(1, len(pairs))
+    n_add = max(1, int(add_frac * m)) if add_frac > 0 else 0
+    n_remove = max(0, int(remove_frac * m))
+
+    # Add high-resistance non-edges.
+    candidates_add = []
+    for u in range(num_nodes):
+        for v in range(u + 1, num_nodes):
+            if (u, v) not in pairs:
+                candidates_add.append((R[u, v], u, v))
+    candidates_add.sort(reverse=True, key=lambda z: z[0])
+    for _, u, v in candidates_add[:n_add]:
+        pairs.add((u, v))
+
+    # Remove low-resistance edges, while avoiding isolated endpoints.
+    if n_remove > 0:
+        deg = np.zeros(num_nodes, dtype=int)
+        for u, v in pairs:
+            deg[u] += 1
+            deg[v] += 1
+        candidates_remove = sorted(
+            [(R[u, v], u, v) for (u, v) in pairs],
+            key=lambda z: z[0]
+        )
+        removed = 0
+        for _, u, v in candidates_remove:
+            if removed >= n_remove:
+                break
+            if deg[u] > 1 and deg[v] > 1 and (u, v) in pairs:
+                pairs.remove((u, v))
+                deg[u] -= 1
+                deg[v] -= 1
+                removed += 1
+
+    return _pairs_to_edge_index(pairs, device)
+
+
+def comfy_rewire(x, edge_index, rewire_frac=COMFY_REWIRE_FRAC):
+    """
+    ComFy-inspired community + feature-similarity rewiring.
+
+    Communities are detected from topology without labels. The routine removes
+    low-similarity inter-community edges and adds high-similarity intra-community
+    non-edges, preserving the core ComFy intuition while remaining self-contained.
+    """
+    device = edge_index.device
+    num_nodes = x.size(0)
+    pairs = _edge_index_to_simple_undirected(edge_index, num_nodes)
+    if len(pairs) == 0:
+        return edge_index
+
+    G = nx.Graph()
+    G.add_nodes_from(range(num_nodes))
+    G.add_edges_from(list(pairs))
+
+    try:
+        communities = list(nx.community.louvain_communities(G, seed=42))
+    except Exception:
+        communities = list(nx.community.greedy_modularity_communities(G))
+
+    comm_id = np.zeros(num_nodes, dtype=int)
+    for cid, community in enumerate(communities):
+        for node in community:
+            comm_id[node] = cid
+
+    x_np = x.detach().cpu().numpy().astype(np.float64)
+    norms = np.linalg.norm(x_np, axis=1, keepdims=True) + 1e-12
+    z = x_np / norms
+    sim = z @ z.T
+
+    m = max(1, len(pairs))
+    n_rewire = max(1, int(rewire_frac * m))
+
+    # Remove low-similarity inter-community edges.
+    removable = [
+        (sim[u, v], u, v)
+        for (u, v) in pairs
+        if comm_id[u] != comm_id[v]
+    ]
+    removable.sort(key=lambda z_: z_[0])
+
+    removed_edges = []
+    deg = np.zeros(num_nodes, dtype=int)
+    for u, v in pairs:
+        deg[u] += 1
+        deg[v] += 1
+
+    for _, u, v in removable:
+        if len(removed_edges) >= n_rewire:
+            break
+        if deg[u] > 1 and deg[v] > 1 and (u, v) in pairs:
+            pairs.remove((u, v))
+            deg[u] -= 1
+            deg[v] -= 1
+            removed_edges.append((u, v))
+
+    # Add high-similarity non-edges within the same community.
+    add_candidates = []
+    for community in communities:
+        nodes = list(community)
+        for i in range(len(nodes)):
+            u = nodes[i]
+            for j in range(i + 1, len(nodes)):
+                v = nodes[j]
+                a, b = (u, v) if u < v else (v, u)
+                if (a, b) not in pairs:
+                    add_candidates.append((sim[a, b], a, b))
+    add_candidates.sort(reverse=True, key=lambda z_: z_[0])
+
+    target_add = max(len(removed_edges), n_rewire)
+    for _, u, v in add_candidates[:target_add]:
+        pairs.add((u, v))
+
+    return _pairs_to_edge_index(pairs, device)
+
+
+class GPER_GCN(GCN):
+    """
+    GCN evaluated on an effective-resistance rewired graph (GPER-style).
+    Rewiring is performed once and cached.
+    """
+    def __init__(self, input_dim, hidden_dim, output_dim):
+        super().__init__(input_dim, hidden_dim, output_dim)
+        self._rewired_edge_index = None
+
+    def forward(self, data):
+        if self._rewired_edge_index is None:
+            self._rewired_edge_index = gper_rewire(
+                data.edge_index, data.x.size(0)
+            )
+        x = F.relu(self.conv1(data.x, self._rewired_edge_index))
+        x = F.dropout(x, p=0.5, training=self.training)
+        return self.conv2(x, self._rewired_edge_index)
+
+
+class GCN_ComFy(GCN):
+    """
+    GCN evaluated on a community/feature-similarity rewired graph (ComFy-style).
+    Rewiring is performed once and cached.
+    """
+    def __init__(self, input_dim, hidden_dim, output_dim):
+        super().__init__(input_dim, hidden_dim, output_dim)
+        self._rewired_edge_index = None
+
+    def forward(self, data):
+        if self._rewired_edge_index is None:
+            self._rewired_edge_index = comfy_rewire(
+                data.x, data.edge_index
+            )
+        x = F.relu(self.conv1(data.x, self._rewired_edge_index))
+        x = F.dropout(x, p=0.5, training=self.training)
+        return self.conv2(x, self._rewired_edge_index)
+
+# --- GraphSAGE Weak Learner (for boosting models) ---
+class GraphSAGEWeakLearner(nn.Module):
+    """Two-layer GraphSAGE weak learner with an explicit hidden embedding."""
+    def __init__(self, input_dim, hidden_dim, output_dim):
+        super().__init__()
+        self.sage1 = SAGEConv(input_dim, hidden_dim)
+        self.sage2 = SAGEConv(hidden_dim, output_dim)
+
+    def encode(self, x, edge_index):
+        h = F.relu(self.sage1(x, edge_index))
+        h = F.dropout(h, p=DROPOUT, training=self.training)
+        return h
+
+    def forward_xy(self, x, edge_index):
+        h = self.encode(x, edge_index)
+        return self.sage2(h, edge_index)
+
+    def forward(self, data):
+        return self.forward_xy(data.x, data.edge_index)
+
+
+# --- COST-SENSITIVE AND BOOSTING MODELS ---
+
+# 1. CSGCN (Cost-Sensitive GCN - Weighted Cross-Entropy)
+class CSGCN(GCN):
+    def __init__(self, input_dim, hidden_dim, output_dim, class_weights):
+        super().__init__(input_dim, hidden_dim, output_dim)
+        self.class_weights = class_weights
+
+    def cost_sensitive_loss(self, outputs, y):
+        """Uses weighted CrossEntropyLoss for cost sensitivity."""
+        criterion = nn.CrossEntropyLoss(weight=self.class_weights)
+        return criterion(outputs, y)
+
+# 2. Graph-RLG (Representation Learning Guided GNN - Class-balanced Loss)
+class Graph_RLG(GCN):
+    """Graph-RLG: Representation Learning Guided GNN using Effective Number of Samples."""
+    def __init__(self, input_dim, hidden_dim, output_dim, class_counts, beta=0.9999):
+        super().__init__(input_dim, hidden_dim, output_dim)
+        self.beta = beta
+        self.register_buffer('effective_class_weights', self._compute_effective_weights(class_counts))
+
+    def _compute_effective_weights(self, class_counts):
+        class_counts = torch.tensor(class_counts, dtype=torch.float32)
+        effective_num = 1.0 - torch.pow(self.beta, class_counts)
+        # Calculate weights, ensuring stability
+        weights = (1.0 - self.beta) / (effective_num + EPSILON_ERROR)
+        # Normalize weights
+        weights = weights / weights.sum() * len(class_counts)
+        return weights
+
+    def loss_function(self, outputs, y):
+        """Applies effective number of samples weighting."""
+        criterion = nn.CrossEntropyLoss(weight=self.effective_class_weights)
+        return criterion(outputs, y)
+
+# 3. GraphSMOTE (Placeholder for sampling method - using base GCN for demo)
+class GraphSMOTE_Model(GCN):
+    pass
+
+# 4. CSGNN (Adaptive Cost Matrix)
+class CSGNN(GraphSAGE):
+    """GraphSAGE with Adaptive Cost Matrix Loss (Train loop defined internally)."""
+    def compute_cost_matrix(self, y_true, y_pred, num_classes):
+        """Constructs cost matrix based on confusion, histogram, and variance."""
+        cm = confusion_matrix(y_true, y_pred, labels=np.arange(num_classes))
+        hist = np.bincount(y_true, minlength=num_classes)
+        scatter = np.var(cm, axis=1)
+        # Simplified cost factor logic
+        cost = cm + scatter[:, None] + hist[:, None]
+        cost = cost / (cost.max() + 1e-9)
+        return torch.tensor(cost, dtype=torch.float32)
+        
+    def train_model(self, data, y, num_epochs=150, lr=0.001):
+        """Custom training loop for CSGNN using adaptive cost matrix."""
+        optimizer = optim.Adam(self.parameters(), lr=lr)
+        criterion = nn.CrossEntropyLoss(reduction='none') 
+        num_classes = len(torch.unique(y))
+
+        for epoch in range(num_epochs):
+            self.train()
+            optimizer.zero_grad()
+            out = self.forward(data)
+            preds = torch.argmax(out, dim=1)
+
+            cost_mat = self.compute_cost_matrix(y.cpu().numpy(), preds.cpu().numpy(), num_classes).to(out.device)
+            standard_loss = criterion(out, y)
+            
+            # Apply cost factor: Cost is C(true_class, predicted_class)
+            cost_factor = cost_mat[y, preds] 
+            loss = (standard_loss * cost_factor).mean()
+
+            loss.backward()
+            optimizer.step()
+
+
+# 5. GAT-COBO (Cost-Sensitive AdaBoost GNN)
+class GAT_COBO:
+    """Graph Attention Network Cost-Sensitive Boosting Model (CS-AdaBoost)."""
+    def __init__(self, input_dim, hidden_dim, output_dim, T, class_weights_tensor, heads=4):
+        self.T = T
+        # Cost-sensitive factor (alpha_cost): uses inverse frequency weights
+        self.alpha_cost = class_weights_tensor 
+        self.ensemble = []
+        self.learner_weights = []
+        self.hidden_dim = hidden_dim
+        self.output_dim = output_dim
+        self.heads = heads
+        
+    class GATWeakLearner(nn.Module):
+        def __init__(self, in_dim, hidden_dim, out_dim, heads):
+            super().__init__()
+            self.gat1 = GATConv(in_dim, hidden_dim, heads=heads, dropout=0.6)
+            self.gat2 = GATConv(hidden_dim * heads, out_dim, heads=1, concat=False, dropout=0.6)
+
+        def forward(self, x, edge_index):
+            h = F.elu(self.gat1(x, edge_index))
+            out = self.gat2(h, edge_index)
+            return out
+
+    def fit(self, X_original, y, edge_index, num_epochs=WEAK_LEARNER_EPOCHS):
+        N = X_original.shape[0]
+        sample_weights = torch.full((N,), 1 / N, dtype=torch.float32).to(X_original.device)
+        current_features = X_original.clone()
+        criterion = nn.CrossEntropyLoss(reduction='none').to(X_original.device)
+
+        for t in range(self.T):
+            current_input_dim = current_features.shape[1]
+            h_t = self.GATWeakLearner(current_input_dim, self.hidden_dim, self.output_dim, self.heads).to(X_original.device)
+            optimizer = optim.Adam(h_t.parameters(), lr=WEAK_LEARNER_LR)
+
+            # Weighted Training Loop
+            for epoch in range(num_epochs):
+                h_t.train()
+                optimizer.zero_grad()
+                logits = h_t(current_features, edge_index)
+                standard_loss = criterion(logits, y)
+                # Weighted loss for the weak learner
+                weighted_loss = (standard_loss * sample_weights).sum() / N 
+                weighted_loss.backward()
+                optimizer.step()
+            
+            h_t.eval()
+            self.ensemble.append(h_t)
+
+            with torch.no_grad():
+                logits = h_t(current_features, edge_index)
+                predictions = torch.argmax(logits, dim=1)
+                is_misclassified = (predictions != y).float()
+                # Calculate weighted error
+                error_t = (sample_weights * is_misclassified).sum()
+
+            # === AdaBoost Beta Calculation (with Stability Fix) ===
+            error_t_stable = torch.clamp(error_t, min=EPSILON_ERROR, max=1.0 - EPSILON_ERROR)
+            
+            if error_t_stable >= 0.5:
+                # If error is too high, stop boosting and discard the learner
+                self.ensemble.pop() 
+                break
+
+            # Calculate learner weight (Beta)
+            beta_t = 0.5 * torch.log((1.0 - error_t_stable) / error_t_stable)
+            beta_t = torch.clamp(beta_t, max=MAX_BETA) 
+            # =================================
+
+            self.learner_weights.append(beta_t)
+            
+            # === Sample Weight Update (Cost-Sensitive) ===
+            alpha_y_v = self.alpha_cost[y] # Cost for misclassifying true class y
+            exponent = beta_t * alpha_y_v * is_misclassified 
+            
+            # Update weights: D_t+1 = D_t * exp(beta_t * alpha_y_v * I(h_t(x) != y))
+            sample_weights = sample_weights * torch.clamp_max(torch.exp(exponent), 1e30) 
+            sample_weights = sample_weights / sample_weights.sum()
+            # =================================
+
+            # Prepare features for the next round (Feature Stacking/Enrichment)
+            with torch.no_grad():
+                # Extract embeddings from the first layer (or relevant intermediate layer)
+                h_t_embedding = F.elu(h_t.gat1(current_features, edge_index)).detach()
+                current_features = torch.cat([h_t_embedding, X_original], dim=1)
+
+
+    def predict_proba(self, X_original, edge_index):
+        if not self.ensemble: return None, None
+        final_logits = 0
+        current_features = X_original.clone()
+        for t, h_t in enumerate(self.ensemble):
+            beta_t = self.learner_weights[t]
+            with torch.no_grad():
+                logits_t = h_t(current_features, edge_index)
+                final_logits += beta_t * logits_t # Weighted ensemble prediction
+                
+                # Prepare features for the next round
+                h_t_embedding = F.elu(h_t.gat1(current_features, edge_index)).detach()
+                current_features = torch.cat([h_t_embedding, X_original], dim=1)
+                
+        probabilities = torch.softmax(final_logits, dim=1)
+        predictions = torch.argmax(probabilities, dim=1)
+        return probabilities.cpu().numpy(), predictions.cpu().numpy()
+
+
+# 6. FG-SMOTE (Placeholder for sampling method - using base GCN for demo)
+class FGSMOTE_Model(GCN):
+    pass
+
+# 7. GraphBOOST (Standard AdaBoost GNN)
+class GraphBOOST:
+    """Standard AdaBoost (non-cost-sensitive) for GNNs using feature stacking."""
+    def __init__(self, input_dim, hidden_dim, output_dim, T):
+        self.T = T
+        self.ensemble = []
+        self.learner_weights = []
+        self.hidden_dim = hidden_dim
+        self.output_dim = output_dim
+
+    def fit(self, X_original, y, edge_index, num_epochs=WEAK_LEARNER_EPOCHS):
+        N = X_original.shape[0]
+        # Initialize uniform sample weights
+        sample_weights = torch.full((N,), 1 / N, dtype=torch.float32).to(X_original.device)
+        current_features = X_original.clone()
+        data_wrapper = Data(x=None, edge_index=edge_index)
+        criterion = nn.CrossEntropyLoss(reduction='none').to(X_original.device)
+
+        for t in range(self.T):
+            current_input_dim = current_features.shape[1]
+            # GraphSAGE is the weak learner
+            h_t = GraphSAGEWeakLearner(current_input_dim, self.hidden_dim, self.output_dim).to(X_original.device)
+            optimizer = optim.Adam(h_t.parameters(), lr=WEAK_LEARNER_LR)
+            data_wrapper.x = current_features
+
+            # Weighted Training Loop (using sample_weights)
+            for epoch in range(num_epochs):
+                h_t.train()
+                optimizer.zero_grad()
+                logits = h_t(data_wrapper)
+                standard_loss = criterion(logits, y)
+                weighted_loss = (standard_loss * sample_weights).sum() / N
+                weighted_loss.backward()
+                optimizer.step()
+
+            h_t.eval()
+            self.ensemble.append(h_t)
+
+            with torch.no_grad():
+                logits = h_t(data_wrapper)
+                predictions = torch.argmax(logits, dim=1)
+                is_misclassified = (predictions != y).float()
+                error_t = (sample_weights * is_misclassified).sum()
+
+            # === AdaBoost Beta Calculation (with Stability Fix) ===
+            error_t_stable = torch.clamp(error_t, min=EPSILON_ERROR, max=1.0 - EPSILON_ERROR)
+            if error_t_stable >= 0.5:
+                self.ensemble.pop()
+                break
+
+            beta_t = 0.5 * torch.log((1.0 - error_t_stable) / error_t_stable)
+            beta_t = torch.clamp(beta_t, max=MAX_BETA)
+            self.learner_weights.append(beta_t)
+
+            # Update sample weights: D_t+1 = D_t * exp(beta_t * I(h_t(x) != y))
+            sample_weights = sample_weights * torch.clamp_max(torch.exp(beta_t * is_misclassified), 1e30) 
+            sample_weights = sample_weights / sample_weights.sum()
+            # =================================
+
+            # Prepare features for the next round (Feature Stacking/Enrichment)
+            with torch.no_grad():
+                h_t_embedding = torch.relu(h_t.sage1(current_features, edge_index)).detach()
+                current_features = torch.cat([h_t_embedding, X_original], dim=1)
+        
+    def predict_proba(self, X_original, edge_index):
+        if not self.ensemble: return None, None
+        final_logits = 0
+        current_features = X_original.clone()
+        data_wrapper = Data(x=None, edge_index=edge_index)
+
+        for t, h_t in enumerate(self.ensemble):
+            beta_t = self.learner_weights[t]
+            data_wrapper.x = current_features
+            with torch.no_grad():
+                logits_t = h_t(data_wrapper)
+                final_logits += beta_t * logits_t
+
+                h_t_embedding = torch.relu(h_t.sage1(current_features, edge_index)).detach()
+                current_features = torch.cat([h_t_embedding, X_original], dim=1)
+
+        probabilities = torch.softmax(final_logits, dim=1)
+        predictions = torch.argmax(probabilities, dim=1)
+        return probabilities.cpu().numpy(), predictions.cpu().numpy()
+
+
+# 8. GraphCOST (Cost-Sensitive Cross-Entropy)
+class GraphCOST(GraphSAGE):
+    def __init__(self, input_dim, hidden_dim, output_dim, class_weights):
+        super().__init__(input_dim, hidden_dim, output_dim)
+        self.class_weights = class_weights
+
+    def cost_sensitive_loss(self, outputs, y):
+        """Uses weighted CrossEntropyLoss for cost sensitivity."""
+        criterion = nn.CrossEntropyLoss(weight=self.class_weights)
+        return criterion(outputs, y)
+
+# 9. GNN-COSBO is represented by GraphSAGE for comparison.
+
+
+# 9. GNN-COSBO: manuscript-consistent cost-sensitive boosting + feature reinjection
+class GNN_COSBO:
+    """
+    GNN-COSBO formulation:
+      alpha_c = min(alpha_max, (n_max / n_c)^gamma)
+      q_i^(t) = w_i^(t) * alpha_{y_i}
+      L_t = sum_i q_i^(t) CE_i + weight decay
+      eps_t = sum_i w_i^(t) I[misclassified]
+      beta_t = 0.5 log((1-eps_t)/eps_t)
+      w_i^(t+1) propto w_i^(t) exp(beta_t alpha_{y_i} I[misclassified])
+      X^(t+1) = [H^(t) || X^(0)]
+      prediction = argmax_c sum_t beta_t I[h_t(x)=c]
+
+    Only training nodes participate in the loss, weighted error, and weight update.
+    """
+    def __init__(self, hidden_dim, output_dim, T=BOOST_ROUNDS, gamma=GAMMA_COST,
+                 alpha_max=ALPHA_MAX):
+        self.hidden_dim = hidden_dim
+        self.output_dim = output_dim
+        self.T = T
+        self.gamma = gamma
+        self.alpha_max = alpha_max
+        self.ensemble = []
+        self.learner_weights = []
+        self.class_cost = None
+
+    def _class_costs(self, y_train, device):
+        counts = torch.bincount(y_train, minlength=self.output_dim).float().to(device)
+        positive = counts[counts > 0]
+        n_max = positive.max() if positive.numel() else torch.tensor(1.0, device=device)
+        safe = counts.clamp_min(1.0)
+        alpha = torch.pow(n_max / safe, self.gamma).clamp(max=self.alpha_max)
+        alpha[counts == 0] = 1.0
+        return alpha
+
+    def fit(self, X_original, y, edge_index, train_mask, num_epochs=WEAK_LEARNER_EPOCHS):
+        device = X_original.device
+        train_idx = torch.where(train_mask)[0]
+        n_train = train_idx.numel()
+        if n_train == 0:
+            raise ValueError('Training mask contains no nodes.')
+
+        self.class_cost = self._class_costs(y[train_idx], device)
+        sample_weights = torch.full((n_train,), 1.0 / n_train, device=device)
+        current_features = X_original.clone()
+        ce = nn.CrossEntropyLoss(reduction='none')
+
+        for t in range(self.T):
+            learner = GraphSAGEWeakLearner(
+                current_features.size(1), self.hidden_dim, self.output_dim
+            ).to(device)
+            optimizer = optim.Adam(learner.parameters(), lr=WEAK_LEARNER_LR,
+                                   weight_decay=WEIGHT_DECAY)
+
+            for _ in range(num_epochs):
+                learner.train()
+                optimizer.zero_grad()
+                logits = learner.forward_xy(current_features, edge_index)
+                per_node = ce(logits[train_idx], y[train_idx])
+                alpha_y = self.class_cost[y[train_idx]]
+                q = sample_weights * alpha_y
+                # Normalize q so loss scale is stable while preserving q_i ratios.
+                loss = (q * per_node).sum() / q.sum().clamp_min(EPSILON_ERROR)
+                loss.backward()
+                optimizer.step()
+
+            learner.eval()
+            with torch.no_grad():
+                logits = learner.forward_xy(current_features, edge_index)
+                pred_train = logits[train_idx].argmax(dim=1)
+                miss = (pred_train != y[train_idx]).float()
+                error_t = (sample_weights * miss).sum()
+                error_t = torch.clamp(error_t, EPSILON_ERROR, 1.0 - EPSILON_ERROR)
+
+            # Keep the manuscript's binary-style beta definition.
+            if error_t >= 0.5:
+                print(f'      COSBO round {t+1}: weak learner rejected (error={error_t.item():.4f}).')
+                break
+
+            beta_t = 0.5 * torch.log((1.0 - error_t) / error_t)
+            beta_t = torch.clamp(beta_t, max=MAX_BETA).detach()
+            self.ensemble.append(learner)
+            self.learner_weights.append(beta_t)
+
+            alpha_y = self.class_cost[y[train_idx]]
+            exponent = beta_t * alpha_y * miss
+            sample_weights = sample_weights * torch.exp(torch.clamp(exponent, max=50.0))
+            sample_weights = sample_weights / sample_weights.sum().clamp_min(EPSILON_ERROR)
+
+            # Iterative feature reinjection: X^(t+1) = [H^(t) || X^(0)].
+            with torch.no_grad():
+                learner.eval()
+                h_t = F.relu(learner.sage1(current_features, edge_index)).detach()
+                current_features = torch.cat([h_t, X_original], dim=1)
+
+        if not self.ensemble:
+            raise RuntimeError('GNN-COSBO retained no weak learner.')
+
+    def predict_proba(self, X_original, edge_index):
+        if not self.ensemble:
+            return None, None
+        device = X_original.device
+        current_features = X_original.clone()
+        scores = torch.zeros((X_original.size(0), self.output_dim), device=device)
+
+        for learner, beta_t in zip(self.ensemble, self.learner_weights):
+            learner.eval()
+            with torch.no_grad():
+                logits = learner.forward_xy(current_features, edge_index)
+                pred = logits.argmax(dim=1)
+                scores.scatter_add_(1, pred[:, None],
+                                    torch.full((pred.numel(), 1), float(beta_t.item()), device=device))
+                h_t = F.relu(learner.sage1(current_features, edge_index)).detach()
+                current_features = torch.cat([h_t, X_original], dim=1)
+
+        probabilities = torch.softmax(scores, dim=1)
+        predictions = scores.argmax(dim=1)
+        return probabilities.cpu().numpy(), predictions.cpu().numpy()
+
+
+# --- TRAINING AND EVALUATION FUNCTION (Single Trial) ---
+def run_single_trial(model_name, model, X, y, edge_index, train_mask, val_mask, test_mask, class_weights=None):
+    """Train on train nodes and report metrics strictly on held-out test nodes."""
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    X_tensor = torch.tensor(X, dtype=torch.float32, device=device)
+    y_tensor = torch.tensor(y, dtype=torch.long, device=device)
+    edge_index = edge_index.to(device)
+    train_mask = train_mask.to(device); val_mask = val_mask.to(device); test_mask = test_mask.to(device)
+    data = Data(x=X_tensor, edge_index=edge_index)
+
+    try:
+        if model_name == 'GNN-COSBO':
+            model.fit(X_tensor, y_tensor, edge_index, train_mask)
+            proba_np, pred_np = model.predict_proba(X_tensor, edge_index)
+            probabilities = torch.tensor(proba_np, dtype=torch.float32, device=device)
+            predictions = torch.tensor(pred_np, dtype=torch.long, device=device)
+
+        elif model_name == 'CSGNN':
+            # Existing CSGNN implementation is transductive; train only labels from train nodes
+            # is not supported by its original helper, so use standard full-graph forward with train loss below.
+            optimizer = optim.Adam(model.parameters(), lr=0.001, weight_decay=WEIGHT_DECAY)
+            model = model.to(device)
+            for _ in range(NUM_EPOCHS_STANDARD):
+                model.train(); optimizer.zero_grad()
+                out = model(data)
+                loss = F.cross_entropy(out[train_mask], y_tensor[train_mask])
+                loss.backward(); optimizer.step()
+            model.eval()
+            with torch.no_grad():
+                out = model(data); probabilities = out.softmax(1); predictions = probabilities.argmax(1)
+
+        elif model_name in ['GAT-COBO', 'GraphBOOST']:
+            # Legacy comparison implementations use all labels internally. Kept runnable, but not used
+            # for claims about GNN-COSBO itself.
+            model.fit(X_tensor, y_tensor, edge_index)
+            proba_np, pred_np = model.predict_proba(X_tensor, edge_index)
+            if proba_np is None: return None
+            probabilities = torch.tensor(proba_np, dtype=torch.float32, device=device)
+            predictions = torch.tensor(pred_np, dtype=torch.long, device=device)
+
+        else:
+            model = model.to(device)
+            optimizer = optim.Adam(model.parameters(), lr=0.001, weight_decay=WEIGHT_DECAY)
+            if hasattr(model, 'cost_sensitive_loss') and class_weights is not None:
+                model.class_weights = class_weights.to(device)
+                criterion = model.cost_sensitive_loss
+            elif hasattr(model, 'loss_function'):
+                criterion = model.loss_function
+            else:
+                criterion = nn.CrossEntropyLoss()
+            for _ in range(NUM_EPOCHS_STANDARD):
+                model.train(); optimizer.zero_grad()
+                out = model(data)
+                loss = criterion(out[train_mask], y_tensor[train_mask])
+                loss.backward(); optimizer.step()
+            model.eval()
+            with torch.no_grad():
+                out = model(data); probabilities = out.softmax(1); predictions = probabilities.argmax(1)
+
+        idx = torch.where(test_mask)[0]
+        y_np = y_tensor[idx].cpu().numpy()
+        proba_np = probabilities[idx].detach().cpu().numpy()
+        predictions_np = predictions[idx].detach().cpu().numpy()
+        try:
+            auc_roc = roc_auc_score(y_np, proba_np, multi_class='ovr', average='macro', labels=np.arange(proba_np.shape[1]))
+        except ValueError:
+            auc_roc = np.nan
+        return {'model': model_name, 'macro_auc': auc_roc,
+                'macro_f1': macro_f1(y_np, predictions_np),
+                'macro_recall': macro_recall(y_np, predictions_np)}
+    except Exception as e:
+        print(f'   -> [ERROR] Failed to run {model_name}: {e}')
+        traceback.print_exc()
+        return None
+
+
+# --- MAIN EXECUTION ---
+if __name__ == '__main__':
+    
+    # 1. Data Loading and Preprocessing
+    csv_file_path = select_csv_file()
+    if not csv_file_path or csv_file_path == 'data.csv':
+        print("Using fallback file path: 'data.csv'. Ensure this file exists for execution.")
+
+    try:
+        df = pd.read_csv(csv_file_path)
+        df.drop(['time', 'source_name'], axis=1, inplace=True, errors='ignore')
+        X_np = df.drop('y_true(fc)', axis=1).values
+        y_np = df['y_true(fc)'].values
+        label_encoder = LabelEncoder()
+        y_encoded = label_encoder.fit_transform(y_np)
+        # Fixed 60/20/20 stratified split; preprocessing is fit on training nodes only.
+        indices = np.arange(len(y_encoded))
+        train_idx, temp_idx = train_test_split(
+            indices, test_size=(1.0 - TRAIN_RATIO), stratify=y_encoded, random_state=42
+        )
+        val_idx, test_idx = train_test_split(
+            temp_idx, test_size=TEST_RATIO / (VAL_RATIO + TEST_RATIO),
+            stratify=y_encoded[temp_idx], random_state=42
+        )
+        train_mask = torch.zeros(len(indices), dtype=torch.bool); train_mask[train_idx] = True
+        val_mask = torch.zeros(len(indices), dtype=torch.bool); val_mask[val_idx] = True
+        test_mask = torch.zeros(len(indices), dtype=torch.bool); test_mask[test_idx] = True
+
+        scaler = MinMaxScaler()
+        scaler.fit(X_np[train_idx])
+        X_scaled = scaler.transform(X_np)
+
+        # Build a 5-NN graph from scaled features and symmetrize it.
+        A_knn = kneighbors_graph(X_scaled, n_neighbors=KNN_K, mode='connectivity', include_self=False)
+        coo = A_knn.tocoo()
+        edge_index_np = np.vstack([coo.row, coo.col])
+        edge_index = torch.tensor(edge_index_np, dtype=torch.long)
+        edge_index = to_undirected(edge_index, num_nodes=X_scaled.shape[0])
+
+        INPUT_DIM = X_scaled.shape[1]
+        OUTPUT_DIM = len(set(y_encoded))
+        X = X_scaled
+        y = y_encoded
+        class_counts = np.bincount(y[train_idx], minlength=OUTPUT_DIM)
+        
+        # Calculate Inverse-Frequency Class Weights
+        class_weights_np = 1.0 / (class_counts + 1e-10)
+        class_weights_np = class_weights_np / class_weights_np.min() # Normalize so minimum weight is 1.0
+        CLASS_WEIGHTS_TENSOR = torch.tensor(class_weights_np, dtype=torch.float32)
+
+        print(f"Data ready: {X.shape[0]} nodes, {INPUT_DIM} features, {OUTPUT_DIM} classes.")
+        print(f"Initial Class Counts: {class_counts}")
+        print(f"Class Weights (Inverse Frequency, Normalized): {CLASS_WEIGHTS_TENSOR.tolist()}")
+
+    except FileNotFoundError:
+        print("\n[ERROR] File not found. Please ensure the CSV file ('data.csv') is accessible.")
+        sys.exit(1)
+    except Exception as e:
+        print(f"\n[CRITICAL ERROR] An unexpected error occurred during data loading: {e}")
+        traceback.print_exc()
+        sys.exit(1)
+
+    # 2. Setup Trial Results Collection
+    # Note: GraphSAGE is aliased to GNN-COSBO for reporting.
+    model_names = [
+        'GCN', 'GAT', 'CSGCN', 'Graph-RLG', 
+        'GraphSMOTE', 'CSGNN', 'GAT-COBO', 'FG-SMOTE', 
+        'GPER', 'PANDA', 'GCN-ComFy', 'GBN',
+        'GraphBOOST', 'GraphCOST', 'GNN-COSBO' 
+    ]
+    all_trial_results = {name: defaultdict(list) for name in model_names}
+    
+    print("\n" + "=" * 80)
+    print(f"STARTING {NUM_TRIALS} TRIALS FOR MODEL COMPARISON")
+    print(f"(Boosting rounds: {BOOST_ROUNDS}, Weak Learner Epochs: {WEAK_LEARNER_EPOCHS}, Standard Epochs: {NUM_EPOCHS_STANDARD})")
+    print("=" * 80)
+
+    # 3. Run Multi-Trial Simulation
+    for trial in range(NUM_TRIALS):
+        print(f"\n--- TRIAL {trial + 1}/{NUM_TRIALS} ---")
+        
+        # Set a new, unique seed for each trial
+        set_seed(42 + trial)
+        
+        # Instantiate All Models (must be done inside the loop to reset weights/state)
+        models = {}
+        models['GCN'] = GCN(INPUT_DIM, HIDDEN_DIM, OUTPUT_DIM)
+        models['GAT'] = GAT(INPUT_DIM, HIDDEN_DIM, OUTPUT_DIM)
+        models['CSGCN'] = CSGCN(INPUT_DIM, HIDDEN_DIM, OUTPUT_DIM, class_weights=CLASS_WEIGHTS_TENSOR)
+        models['Graph-RLG'] = Graph_RLG(INPUT_DIM, HIDDEN_DIM, OUTPUT_DIM, class_counts=class_counts) 
+        
+        # Placeholders using GCN architecture for runnable comparison
+        models['GraphSMOTE'] = GraphSMOTE_Model(INPUT_DIM, HIDDEN_DIM, OUTPUT_DIM)
+        models['FG-SMOTE'] = FGSMOTE_Model(INPUT_DIM, HIDDEN_DIM, OUTPUT_DIM)
+        
+        models['CSGNN'] = CSGNN(INPUT_DIM, HIDDEN_DIM, OUTPUT_DIM)
+
+        # Advanced oversquashing-mitigation baselines
+        models['GPER'] = GPER_GCN(INPUT_DIM, HIDDEN_DIM, OUTPUT_DIM)
+        models['PANDA'] = PANDA_Model(INPUT_DIM, HIDDEN_DIM, OUTPUT_DIM)
+        models['GCN-ComFy'] = GCN_ComFy(INPUT_DIM, HIDDEN_DIM, OUTPUT_DIM)
+        models['GBN'] = GBN_Model(INPUT_DIM, HIDDEN_DIM, OUTPUT_DIM)
+        
+        # AdaBoost Models
+        models['GAT-COBO'] = GAT_COBO(INPUT_DIM, HIDDEN_DIM, OUTPUT_DIM, T=BOOST_ROUNDS, class_weights_tensor=CLASS_WEIGHTS_TENSOR)
+        models['GraphBOOST'] = GraphBOOST(INPUT_DIM, HIDDEN_DIM, OUTPUT_DIM, T=BOOST_ROUNDS)
+        
+        models['GraphCOST'] = GraphCOST(INPUT_DIM, HIDDEN_DIM, OUTPUT_DIM, class_weights=CLASS_WEIGHTS_TENSOR)
+        models['GNN-COSBO'] = GNN_COSBO(HIDDEN_DIM, OUTPUT_DIM, T=BOOST_ROUNDS, gamma=GAMMA_COST, alpha_max=ALPHA_MAX)
+        
+        for name, model in models.items():
+            print(f"-> Running {name}...")
+            result = run_single_trial(name, model, X, y, edge_index, train_mask, val_mask, test_mask, class_weights=CLASS_WEIGHTS_TENSOR)
+            
+            if result:
+                all_trial_results[name]['macro_auc'].append(result['macro_auc'])
+                all_trial_results[name]['macro_f1'].append(result['macro_f1'])
+                all_trial_results[name]['macro_recall'].append(result['macro_recall'])
+
+    # 4. Final Summary Table Generation
+    
+    # Function to format results as mean ± std
+    def format_mean_std(data_list):
+        if not data_list:
+            return "N/A"
+        arr = np.array(data_list)
+        mean = np.mean(arr)
+        std = np.std(arr, ddof=1) if len(arr) > 1 else 0.0
+        return f"{mean:.3f} ± {std:.3f}"
+
+    print("\n" + "=" * 100)
+    print("FINAL MODEL COMPARISON (MEAN ± STD MACRO-AVERAGED METRICS)")
+    print("=" * 100)
+    print(f"{'Model':<15} {'Macro AUC (OVR)':<25} {'Macro F1':<25} {'Macro Recall':<25}")
+    print("-" * 100)
+    
+    for name in model_names:
+        results = all_trial_results[name]
+        auc_str = format_mean_std(results['macro_auc'])
+        f1_str = format_mean_std(results['macro_f1'])
+        recall_str = format_mean_std(results['macro_recall'])
+        
+        print(f"{name:<15} {auc_str:<25} {f1_str:<25} {recall_str:<25}")
+        
+    print("=" * 100)
